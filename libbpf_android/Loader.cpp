@@ -24,11 +24,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
 #include "LoaderUtils.h"
 #include "include/libbpf_android.h"
+#include <bpf/BpfUtils.h>
 
 #include <cstdlib>
 #include <fstream>
@@ -37,6 +39,7 @@
 #include <vector>
 
 #include <android-base/strings.h>
+#include <android-base/unique_fd.h>
 
 #define BPF_FS_PATH "/sys/fs/bpf/"
 
@@ -44,6 +47,7 @@
 #define BPF_LOAD_LOG_SZ 0x1ffff
 
 using android::base::StartsWith;
+using android::base::unique_fd;
 using std::ifstream;
 using std::ios;
 using std::string;
@@ -82,7 +86,7 @@ typedef struct {
     vector<char> data;
     vector<char> rel_data;
 
-    int prog_fd; /* fd after loading */
+    unique_fd prog_fd; /* fd after loading */
 } codeSection;
 
 /* Common with the eBPF C program */
@@ -94,6 +98,7 @@ struct bpf_map_def {
     unsigned int map_flags;
     unsigned int inner_map_idx;
     unsigned int numa_node;
+    bool clear_on_init;
 };
 
 static int readElfHeader(ifstream& elfFile, Elf64_Ehdr* eh) {
@@ -297,7 +302,6 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
 
         enum bpf_prog_type ptype = getSectionType(name);
         if (ptype != BPF_PROG_TYPE_UNSPEC) {
-            deslash(name);
             cs_temp.type = ptype;
             cs_temp.name = name;
 
@@ -319,7 +323,7 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
         }
 
         if (cs_temp.data.size() > 0) {
-            cs.push_back(cs_temp);
+            cs.push_back(std::move(cs_temp));
             ALOGD("Adding section %d to cs list\n", i);
         }
     }
@@ -380,8 +384,8 @@ static int getMapNames(ifstream& elfFile, vector<string>& names) {
     return 0;
 }
 
-static int createMaps(const char* elfPath, ifstream& elfFile, vector<int>& mapFds) {
-    int ret, fd;
+static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds) {
+    int ret;
     vector<char> mdData;
     vector<struct bpf_map_def> md;
     vector<string> mapNames;
@@ -395,22 +399,25 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<int>& mapFd
     ret = getMapNames(elfFile, mapNames);
     if (ret) return ret;
 
-    mapFds.resize(mapNames.size());
-
     for (int i = 0; i < (int)mapNames.size(); i++) {
+        unique_fd fd;
         // Format of pin location is /sys/fs/bpf/map_<filename>_<mapname>
         string mapPinLoc;
         bool reuse = false;
 
         mapPinLoc = string(BPF_FS_PATH) + "map_" + fname + "_" + string(mapNames[i]);
+        if (access(mapPinLoc.c_str(), F_OK) == 0 && md[i].clear_on_init) {
+            ret = unlink(mapPinLoc.c_str());
+            if (ret < 0) return ret;
+        }
         if (access(mapPinLoc.c_str(), F_OK) == 0) {
-            fd = bpf_obj_get(mapPinLoc.c_str());
-            ALOGD("bpf_create_map reusing map %s, ret: %d\n", mapNames[i].c_str(), fd);
+            fd.reset(bpf_obj_get(mapPinLoc.c_str()));
+            ALOGD("bpf_create_map reusing map %s, ret: %d\n", mapNames[i].c_str(), fd.get());
             reuse = true;
         } else {
-            fd = bpf_create_map(md[i].type, mapNames[i].c_str(), md[i].key_size, md[i].value_size,
-                                md[i].max_entries, md[i].map_flags);
-            ALOGD("bpf_create_map name %s, ret: %d\n", mapNames[i].c_str(), fd);
+            fd.reset(bpf_create_map(md[i].type, mapNames[i].c_str(), md[i].key_size, md[i].value_size,
+                                    md[i].max_entries, md[i].map_flags));
+            ALOGD("bpf_create_map name %s, ret: %d\n", mapNames[i].c_str(), fd.get());
         }
 
         if (fd < 0) return fd;
@@ -421,7 +428,7 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<int>& mapFd
             if (ret < 0) return ret;
         }
 
-        mapFds[i] = fd;
+        mapFds.push_back(std::move(fd));
     }
 
     return ret;
@@ -472,7 +479,7 @@ static void applyRelo(void* insnsPtr, Elf64_Addr offset, int fd) {
     insn->src_reg = BPF_PSEUDO_MAP_FD;
 }
 
-static void applyMapRelo(ifstream& elfFile, vector<int> mapFds, vector<codeSection>& cs) {
+static void applyMapRelo(ifstream& elfFile, vector<unique_fd> &mapFds, vector<codeSection>& cs) {
     vector<string> mapNames;
 
     int ret = getMapNames(elfFile, mapNames);
@@ -513,19 +520,21 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
         // Format of pin location is
         // /sys/fs/bpf/prog_<filename>_<mapname>
-        progPinLoc = string(BPF_FS_PATH) + "prog_" + fname + "_" + cs[i].name;
+        auto progName = cs[i].name;
+        deslash(progName);
+        progPinLoc = string(BPF_FS_PATH) + "prog_" + fname + "_" + progName;
         if (access(progPinLoc.c_str(), F_OK) == 0) {
             fd = bpf_obj_get(progPinLoc.c_str());
-            ALOGD("New bpf prog load reusing prog %s, ret: %d\n", cs[i].name.c_str(), fd);
+            ALOGD("New bpf prog load reusing prog %s, ret: %d\n", progName.c_str(), fd);
             reuse = true;
         } else {
             vector<char> log_buf(BPF_LOAD_LOG_SZ, 0);
 
-            fd = bpf_prog_load(cs[i].type, cs[i].name.c_str(), (struct bpf_insn*)cs[i].data.data(),
+            fd = bpf_prog_load(cs[i].type, progName.c_str(), (struct bpf_insn*)cs[i].data.data(),
                                cs[i].data.size(), license.c_str(), kvers, 0,
                                log_buf.data(), log_buf.size());
-            ALOGD("New bpf core prog_load for %s (%s) returned: %d\n", elfPath, cs[i].name.c_str(),
-                  fd);
+            ALOGD("bpf_prog_load lib call for %s (%s) returned: %d (%s)\n", elfPath,
+                  progName.c_str(), fd, std::strerror(errno));
 
             if (fd <= 0)
                 ALOGE("bpf_prog_load: log_buf contents: %s\n", (char *)log_buf.data());
@@ -539,16 +548,27 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
             if (ret < 0) return ret;
         }
 
-        cs[i].prog_fd = fd;
+        cs[i].prog_fd.reset(fd);
     }
 
     return 0;
 }
 
+int attachPrograms(const vector<codeSection> &cs) {
+    for (const auto &section : cs) {
+        if (section.type != BPF_PROG_TYPE_TRACEPOINT) continue;
+        auto eventData = android::base::Split(section.name, "/");
+        if (eventData.size() != 3) return -1;
+        int ret = bpf_attach_tracepoint(section.prog_fd, eventData[1].c_str(), eventData[2].c_str());
+        if (ret < 0) return ret;
+    }
+    return 0;
+}
+
 int loadProg(const char* elfPath) {
-    vector<char> license;
+    vector<char> license, attach;
     vector<codeSection> cs;
-    vector<int> mapFds;
+    vector<unique_fd> mapFds;
     int ret;
 
     ifstream elfFile(elfPath, ios::in | ios::binary);
@@ -578,14 +598,23 @@ int loadProg(const char* elfPath) {
     }
 
     for (int i = 0; i < (int)mapFds.size(); i++)
-        ALOGD("map_fd found at %d is %d in %s\n", i, mapFds[i], elfPath);
+        ALOGD("map_fd found at %d is %d in %s\n", i, mapFds[i].get(), elfPath);
 
     applyMapRelo(elfFile, mapFds, cs);
 
     ret = loadCodeSections(elfPath, cs, string(license.data()));
-    if (ret) ALOGE("Failed to load programs, loadCodeSections ret=%d\n", ret);
+    if (ret) {
+        ALOGE("Failed to load programs, loadCodeSections ret=%d\n", ret);
+        return ret;
+    }
 
-    return ret;
+    // Treat absent "attach" section as attach = false
+    if (!readSectionByName("attach", elfFile, attach) && *(bool*)attach.data()) {
+        ret = attachPrograms(cs);
+        if (ret) return ret;
+    }
+
+    return 0;
 }
 
 }  // namespace bpf

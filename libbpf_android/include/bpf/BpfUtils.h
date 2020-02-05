@@ -26,9 +26,9 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include <string>
+
 #include "android-base/unique_fd.h"
-#include "netdutils/Slice.h"
-#include "netdutils/StatusOr.h"
 
 #define BPF_PASS 1
 #define BPF_DROP 0
@@ -36,92 +36,12 @@
 #define ptr_to_u64(x) ((uint64_t)(uintptr_t)(x))
 #define DEFAULT_LOG_LEVEL 1
 
-#define MAP_LD_CMD_HEAD 0x18
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
-
-// The BPF instruction bytes that we need to replace. x is a placeholder (e.g., COOKIE_TAG_MAP).
-#define BPF_MAP_SEARCH_PATTERN(x)                                                               \
-    {                                                                                           \
-        0x18, 0x01, 0x00, 0x00,                                                                 \
-        (x)[0], (x)[1], (x)[2], (x)[3],                                                         \
-        0x00, 0x00, 0x00, 0x00,                                                                 \
-        (x)[4], (x)[5], (x)[6], (x)[7]                                                          \
-    }
-
-// The bytes we'll replace them with. x is the actual fd number for the map at runtime.
-// The second byte is changed from 0x01 to 0x11 since 0x11 is the special command used
-// for bpf map fd loading. The original 0x01 is only a normal load command.
-#define BPF_MAP_REPLACE_PATTERN(x)                                                              \
-    {                                                                                           \
-        0x18, 0x11, 0x00, 0x00,                                                                 \
-        (x)[0], (x)[1], (x)[2], (x)[3],                                                         \
-        0x00, 0x00, 0x00, 0x00,                                                                 \
-        (x)[4], (x)[5], (x)[6], (x)[7]                                                          \
-    }
-
-#define MAP_CMD_SIZE 16
 
 #define TEST_LIMIT 8388608
 
 namespace android {
 namespace bpf {
-
-struct UidTag {
-    uint32_t uid;
-    uint32_t tag;
-};
-
-struct StatsKey {
-    uint32_t uid;
-    uint32_t tag;
-    uint32_t counterSet;
-    uint32_t ifaceIndex;
-};
-
-struct StatsValue {
-    uint64_t rxPackets;
-    uint64_t rxBytes;
-    uint64_t txPackets;
-    uint64_t txBytes;
-};
-
-struct Stats {
-    uint64_t rxBytes;
-    uint64_t rxPackets;
-    uint64_t txBytes;
-    uint64_t txPackets;
-    uint64_t tcpRxPackets;
-    uint64_t tcpTxPackets;
-};
-
-struct IfaceValue {
-    char name[IFNAMSIZ];
-};
-
-struct BpfProgInfo {
-    bpf_attach_type attachType;
-    const char* path;
-    const char* name;
-    bpf_prog_type loadType;
-    base::unique_fd fd;
-};
-
-int mapRetrieve(const char* pathname, uint32_t flags);
-
-struct BpfMapInfo {
-    std::array<uint8_t, MAP_CMD_SIZE> search;
-    std::array<uint8_t, MAP_CMD_SIZE> replace;
-    const int fd;
-    std::string path;
-
-    BpfMapInfo(uint64_t dummyFd, const char* mapPath)
-        : BpfMapInfo(dummyFd, android::bpf::mapRetrieve(mapPath, 0)) {}
-
-    BpfMapInfo(uint64_t dummyFd, int realFd, const char* mapPath = "") : fd(realFd), path(mapPath) {
-        search = BPF_MAP_SEARCH_PATTERN((uint8_t*)&dummyFd);
-        replace = BPF_MAP_REPLACE_PATTERN((uint8_t*)&realFd);
-    }
-};
 
 enum class BpfLevel {
     // Devices shipped before P or kernel version is lower than 4.9 do not
@@ -145,19 +65,97 @@ constexpr const uint64_t NONEXISTENT_COOKIE = 0;
 
 constexpr const int MINIMUM_API_REQUIRED = 28;
 
-int createMap(bpf_map_type map_type, uint32_t key_size, uint32_t value_size, uint32_t max_entries,
-              uint32_t map_flags);
-int writeToMapEntry(const base::unique_fd& map_fd, void* key, void* value, uint64_t flags);
-int findMapEntry(const base::unique_fd& map_fd, void* key, void* value);
-int deleteMapEntry(const base::unique_fd& map_fd, void* key);
-int getNextMapKey(const base::unique_fd& map_fd, void* key, void* next_key);
-int getFirstMapKey(const base::unique_fd& map_fd, void* firstKey);
-int bpfProgLoad(bpf_prog_type prog_type, netdutils::Slice bpf_insns, const char* license,
-                uint32_t kern_version, netdutils::Slice bpf_log);
-int bpfFdPin(const base::unique_fd& map_fd, const char* pathname);
-int bpfFdGet(const char* pathname, uint32_t flags);
-int attachProgram(bpf_attach_type type, uint32_t prog_fd, uint32_t cg_fd);
-int detachProgram(bpf_attach_type type, uint32_t cg_fd);
+/* Note: bpf_attr is a union which might have a much larger size then the anonymous struct portion
+ * of it that we are using.  The kernel's bpf() system call will perform a strict check to ensure
+ * all unused portions are zero.  It will fail with E2BIG if we don't fully zero bpf_attr.
+ */
+
+static inline int bpf(int cmd, const bpf_attr& attr) {
+    return syscall(__NR_bpf, cmd, &attr, sizeof(attr));
+}
+
+static inline int createMap(bpf_map_type map_type, uint32_t key_size, uint32_t value_size,
+                            uint32_t max_entries, uint32_t map_flags) {
+    return bpf(BPF_MAP_CREATE, {
+                                       .map_type = map_type,
+                                       .key_size = key_size,
+                                       .value_size = value_size,
+                                       .max_entries = max_entries,
+                                       .map_flags = map_flags,
+                               });
+}
+
+static inline int writeToMapEntry(const base::unique_fd& map_fd, const void* key, const void* value,
+                                  uint64_t flags) {
+    return bpf(BPF_MAP_UPDATE_ELEM, {
+                                            .map_fd = static_cast<__u32>(map_fd.get()),
+                                            .key = ptr_to_u64(key),
+                                            .value = ptr_to_u64(value),
+                                            .flags = flags,
+                                    });
+}
+
+static inline int findMapEntry(const base::unique_fd& map_fd, const void* key, void* value) {
+    return bpf(BPF_MAP_LOOKUP_ELEM, {
+                                            .map_fd = static_cast<__u32>(map_fd.get()),
+                                            .key = ptr_to_u64(key),
+                                            .value = ptr_to_u64(value),
+                                    });
+}
+
+static inline int deleteMapEntry(const base::unique_fd& map_fd, const void* key) {
+    return bpf(BPF_MAP_DELETE_ELEM, {
+                                            .map_fd = static_cast<__u32>(map_fd.get()),
+                                            .key = ptr_to_u64(key),
+                                    });
+}
+
+static inline int getNextMapKey(const base::unique_fd& map_fd, const void* key, void* next_key) {
+    return bpf(BPF_MAP_GET_NEXT_KEY, {
+                                             .map_fd = static_cast<__u32>(map_fd.get()),
+                                             .key = ptr_to_u64(key),
+                                             .next_key = ptr_to_u64(next_key),
+                                     });
+}
+
+static inline int getFirstMapKey(const base::unique_fd& map_fd, void* firstKey) {
+    return getNextMapKey(map_fd, NULL, firstKey);
+}
+
+static inline int bpfFdPin(const base::unique_fd& map_fd, const char* pathname) {
+    return bpf(BPF_OBJ_PIN, {
+                                    .pathname = ptr_to_u64(pathname),
+                                    .bpf_fd = static_cast<__u32>(map_fd.get()),
+                            });
+}
+
+static inline int bpfFdGet(const char* pathname, uint32_t flag) {
+    return bpf(BPF_OBJ_GET, {
+                                    .pathname = ptr_to_u64(pathname),
+                                    .file_flags = flag,
+                            });
+}
+
+static inline int mapRetrieve(const char* pathname, uint32_t flag) {
+    return bpfFdGet(pathname, flag);
+}
+
+static inline int attachProgram(bpf_attach_type type, const base::unique_fd& prog_fd,
+                                const base::unique_fd& cg_fd) {
+    return bpf(BPF_PROG_ATTACH, {
+                                        .target_fd = static_cast<__u32>(cg_fd.get()),
+                                        .attach_bpf_fd = static_cast<__u32>(prog_fd.get()),
+                                        .attach_type = type,
+                                });
+}
+
+static inline int detachProgram(bpf_attach_type type, const base::unique_fd& cg_fd) {
+    return bpf(BPF_PROG_DETACH, {
+                                        .target_fd = static_cast<__u32>(cg_fd.get()),
+                                        .attach_type = type,
+                                });
+}
+
 uint64_t getSocketCookie(int sockFd);
 int setrlimitForTest();
 std::string BpfLevelToString(BpfLevel BpfLevel);
@@ -176,10 +174,6 @@ int synchronizeKernelRCU();
     do {                                                                                \
         if (android::bpf::getBpfSupportLevel() != android::bpf::BpfLevel::NONE) return; \
     } while (0)
-
-bool operator==(const StatsValue& lhs, const StatsValue& rhs);
-bool operator==(const UidTag& lhs, const UidTag& rhs);
-bool operator==(const StatsKey& lhs, const StatsKey& rhs);
 
 }  // namespace bpf
 }  // namespace android

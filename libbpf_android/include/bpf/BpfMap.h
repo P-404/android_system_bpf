@@ -57,7 +57,7 @@ class BpfMap {
   public:
     explicit BpfMap<Key, Value>(const char* pathname) : BpfMap<Key, Value>(pathname, 0) {}
 
-    BpfMap<Key, Value>(bpf_map_type map_type, uint32_t max_entries, uint32_t map_flags) {
+    BpfMap<Key, Value>(bpf_map_type map_type, uint32_t max_entries, uint32_t map_flags = 0) {
         int map_fd = createMap(map_type, sizeof(Key), sizeof(Value), max_entries, map_flags);
         if (map_fd >= 0) mMapFd.reset(map_fd);
     }
@@ -127,6 +127,11 @@ class BpfMap {
                                                    BpfMap<Key, Value>& map)>& filter);
 
     const base::unique_fd& getMap() const { return mMapFd; };
+
+    // Copy assignment operator
+    void operator=(const BpfMap<Key, Value>& other) {
+        mMapFd.reset(fcntl(other.mMapFd.get(), F_DUPFD_CLOEXEC, 0));
+    }
 
     // Move constructor
     void operator=(BpfMap<Key, Value>&& other) noexcept {

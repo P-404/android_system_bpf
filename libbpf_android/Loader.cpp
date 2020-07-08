@@ -564,8 +564,9 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         progPinLoc += '_';
         progPinLoc += name;
         if (access(progPinLoc.c_str(), F_OK) == 0) {
-            fd = bpf_obj_get(progPinLoc.c_str());
-            ALOGD("New bpf prog load reusing prog %s, ret: %d\n", progPinLoc.c_str(), fd);
+            fd = retrieveProgram(progPinLoc.c_str());
+            ALOGD("New bpf prog load reusing prog %s, ret: %d (%s)\n", progPinLoc.c_str(), fd,
+                  (fd < 0 ? std::strerror(errno) : "no error"));
             reuse = true;
         } else {
             vector<char> log_buf(BPF_LOAD_LOG_SZ, 0);
@@ -579,9 +580,15 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
             if (fd < 0) {
                 std::vector<std::string> lines = android::base::Split(log_buf.data(), "\n");
 
-                ALOGE("bpf_prog_load - BEGIN log_buf contents:");
-                for (const auto& line : lines) ALOGE("%s", line.c_str());
-                ALOGE("bpf_prog_load - END log_buf contents.");
+                ALOGW("bpf_prog_load - BEGIN log_buf contents:");
+                for (const auto& line : lines) ALOGW("%s", line.c_str());
+                ALOGW("bpf_prog_load - END log_buf contents.");
+
+                if (cs[i].prog_def->optional) {
+                    ALOGW("failed program is marked optional - continuing...");
+                    continue;
+                }
+                ALOGE("non-optional program failed to load.");
             }
         }
 
@@ -606,21 +613,30 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
     return 0;
 }
 
-int loadProg(const char* elfPath) {
+int loadProg(const char* elfPath, bool* isCritical) {
     vector<char> license;
+    vector<char> critical;
     vector<codeSection> cs;
     vector<unique_fd> mapFds;
     int ret;
 
+    if (!isCritical) return -1;
+    *isCritical = false;
+
     ifstream elfFile(elfPath, ios::in | ios::binary);
     if (!elfFile.is_open()) return -1;
+
+    ret = readSectionByName("critical", elfFile, critical);
+    *isCritical = !ret;
 
     ret = readSectionByName("license", elfFile, license);
     if (ret) {
         ALOGE("Couldn't find license in %s\n", elfPath);
         return ret;
     } else {
-        ALOGD("Loading ELF object %s with license %s\n", elfPath, (char*)license.data());
+        ALOGD("Loading %s%s ELF object %s with license %s\n",
+              *isCritical ? "critical for " : "optional", *isCritical ? (char*)critical.data() : "",
+              elfPath, (char*)license.data());
     }
 
     ret = readCodeSections(elfFile, cs);
@@ -649,10 +665,21 @@ int loadProg(const char* elfPath) {
     return ret;
 }
 
+static bool waitSecondsForProgsLoaded(int seconds) {
+    bool ok =
+            android::base::WaitForProperty("bpf.progs_loaded", "1", std::chrono::seconds(seconds));
+    if (!ok) ALOGW("Waited %ds for bpf.progs_loaded, still waiting...", seconds);
+    return ok;
+}
+
 void waitForProgsLoaded() {
-    while (!android::base::WaitForProperty("bpf.progs_loaded", "1", std::chrono::seconds(5))) {
-        ALOGW("Waited 5s for bpf.progs_loaded, still waiting...");
-    }
+    if (!android::bpf::isBpfSupported()) return;
+
+    if (waitSecondsForProgsLoaded(5)) return;
+    if (waitSecondsForProgsLoaded(10)) return;
+    if (waitSecondsForProgsLoaded(20)) return;
+    while (!waitSecondsForProgsLoaded(60))
+        ;  // loop until success
 }
 
 }  // namespace bpf

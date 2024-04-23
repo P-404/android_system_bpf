@@ -780,7 +780,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
               .log_buf = ptr_to_u64(log_buf.data()),
               .log_size = static_cast<__u32>(log_buf.size()),
             };
-            if (isAtLeastKernelVersion(4, 14, 0))
+            if (isAtLeastKernelVersion(4, 15, 0))
                 strlcpy(req.prog_name, cs[i].name.c_str(), sizeof(req.prog_name));
             fd.reset(bpf(BPF_PROG_LOAD, req));
 

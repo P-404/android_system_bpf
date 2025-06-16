@@ -267,9 +267,9 @@ fn load_libbpf_progs() {
     for file_desc in FILE_ARR {
         if let Err(e) = libbpf_worker(file_desc) {
             if file_desc.critical {
-                panic!("Error when loading {0}: {e}", file_desc.filename);
+                error!("'critical' Error when loading {0}: {e}\n", file_desc.filename);
             } else {
-                error!("Error when loading {0}: {e}", file_desc.filename);
+                error!("Error when loading {0}: {e}\n", file_desc.filename);
             }
         };
     }
